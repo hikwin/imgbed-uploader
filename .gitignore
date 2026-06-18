@@ -1,0 +1,25 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Local databases, logs & configurations
+*.db
+*.log
+uploader_config.json
+images_backup/
+temp/
+
+# Test assets
+test_image.png
+
