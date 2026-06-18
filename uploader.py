@@ -438,6 +438,43 @@ def perform_upload(file_path, provider, config):
             error_msg = res_json["error"]["message"]
         raise Exception(f"Imgse 上传失败: {error_msg}")
 
+    elif provider == "imgurl":
+        uid = config.get("imgurl_uid", "").strip()
+        token = config.get("imgurl_token", "").strip()
+        if not uid or not token:
+            raise Exception("ImgURL 图床未配置 UID 或 Token，请先在设置中填写")
+
+        url = "https://www.imgurl.org/api/v2/upload"
+        with open(file_path, "rb") as f:
+            files = {"file": (file_name, f, mime_type)}
+            data = {"uid": uid, "token": token}
+            response = requests.post(url, files=files, data=data, timeout=45)
+
+        response.raise_for_status()
+        res_json = response.json()
+        if res_json.get("code") == 200 and "url" in res_json.get("data", {}):
+            return res_json["data"]["url"]
+        error_msg = res_json.get("msg", "未知错误")
+        raise Exception(f"ImgURL 上传失败: {error_msg}")
+
+    elif provider == "imgur":
+        client_id = config.get("imgur_client_id", "").strip()
+        if not client_id:
+            raise Exception("Imgur 图床未配置 Client ID，请先在设置中填写")
+
+        url = "https://api.imgur.com/3/image"
+        headers = {"Authorization": f"Client-ID {client_id}"}
+        with open(file_path, "rb") as f:
+            files = {"image": (file_name, f, mime_type)}
+            response = requests.post(url, headers=headers, files=files, timeout=45)
+
+        response.raise_for_status()
+        res_json = response.json()
+        if res_json.get("success") and "data" in res_json and "link" in res_json["data"]:
+            return res_json["data"]["link"]
+        error_msg = res_json.get("data", {}).get("error", "未知错误")
+        raise Exception(f"Imgur 上传失败: {error_msg}")
+
     else:
         raise ValueError(f"未知的图床提供商: {provider}")
 
@@ -511,6 +548,7 @@ LANG_DICTS = {
         "migration_btn": "🔄 图床迁移与链接替换",
         "save_btn": "💾 保存配置",
         "test_btn": "⚡ 测试连接",
+        "test_all_btn": "🔍 测试所有",
         "success_link": "🔗 上传成功链接:",
         "copy_btn": "复制链接",
         "history_title": "📜 上传历史记录",
@@ -525,6 +563,8 @@ LANG_DICTS = {
         "lbl_imgbb_key": "ImgBB API Key (密钥):",
         "lbl_smms_token": "SM.MS Secret Token (密钥):",
         "lbl_imgse_key": "Imgse API Key (密钥):",
+        "lbl_imgurl_key": "ImgURL 认证 (UID:Token 格式):",
+        "lbl_imgur_client_id": "Imgur Client ID:",
         "lbl_no_config": "提示: 该图床不需要任何额外配置",
         
         # Log and Dialog Messages
@@ -635,6 +675,7 @@ LANG_DICTS = {
         "migration_btn": "🔄 Migrate & Replace Links",
         "save_btn": "💾 Save Settings",
         "test_btn": "⚡ Test Connection",
+        "test_all_btn": "🔍 Test All",
         "success_link": "🔗 Upload Success Link:",
         "copy_btn": "Copy Link",
         "history_title": "📜 Upload History",
@@ -649,6 +690,8 @@ LANG_DICTS = {
         "lbl_imgbb_key": "ImgBB API Key (Secret Key):",
         "lbl_smms_token": "SM.MS Secret Token (Secret Key):",
         "lbl_imgse_key": "Imgse API Key (Secret Key):",
+        "lbl_imgurl_key": "ImgURL Auth (UID:Token format):",
+        "lbl_imgur_client_id": "Imgur Client ID:",
         "lbl_no_config": "Hint: No extra configuration needed for this provider",
         
         # Log and Dialog Messages
@@ -872,8 +915,8 @@ class UploaderApp:
         self.lbl_cfg_title.config(text=d["settings_title"])
         self.lbl_prov.config(text=d["default_provider"])
         self.btn_migration.config(text=d["migration_btn"])
-        self.btn_save.config(text=d["save_btn"])
         self.btn_test.config(text=d["test_btn"])
+        self.btn_test_all.config(text=d["test_all_btn"])
         
         self.lbl_link.config(text=d["success_link"])
         self.btn_copy_link.config(text=d["copy_btn"])
@@ -972,7 +1015,9 @@ class UploaderApp:
         self.lbl_context.pack_forget()
         self.context_entry.pack_forget()
         self.tg_shortcut_combo.pack_forget()
+        self.lbl_token_link.pack_forget()
         self.context_entry.config(show="")
+        self._token_link_url = ""
         
         if provider == "telegraph":
             self.lbl_context.config(text=self.trans("lbl_tg_proxy"))
@@ -1000,6 +1045,7 @@ class UploaderApp:
             # Mask API Key input for privacy
             self.context_entry.config(show="*")
             self.context_entry_var.set(self.config.get("imgbb_api_key", ""))
+            self._show_token_link("https://api.imgbb.com/", "获取 API Key ↗" if self._is_zh() else "Get API Key ↗")
 
         elif provider == "sm.ms":
             self.lbl_context.config(text=self.trans("lbl_smms_token"))
@@ -1007,6 +1053,7 @@ class UploaderApp:
             self.context_entry.pack(fill=tk.X, ipady=3)
             self.context_entry.config(show="*")
             self.context_entry_var.set(self.config.get("smms_token", ""))
+            self._show_token_link("https://smms.app/home/apitoken", "获取 Token ↗" if self._is_zh() else "Get Token ↗")
 
         elif provider == "imgse":
             self.lbl_context.config(text=self.trans("lbl_imgse_key"))
@@ -1014,19 +1061,60 @@ class UploaderApp:
             self.context_entry.pack(fill=tk.X, ipady=3)
             self.context_entry.config(show="*")
             self.context_entry_var.set(self.config.get("imgse_api_key", ""))
-            
+            self._show_token_link("https://imgse.com/page/api", "获取 API Key ↗" if self._is_zh() else "Get API Key ↗")
+
+        elif provider == "imgurl":
+            # ImgURL requires UID + Token; user enters them as "UID:Token"
+            stored = self.config.get("imgurl_uid", "") + ":" + self.config.get("imgurl_token", "")
+            self.lbl_context.config(text=self.trans("lbl_imgurl_key"))
+            self.lbl_context.pack(anchor=tk.W, pady=(0, 2))
+            self.context_entry.pack(fill=tk.X, ipady=3)
+            self.context_entry.config(show="")
+            self.context_entry_var.set(stored if stored != ":" else "")
+            self._show_token_link("https://www.imgurl.org/user/settings", "获取 UID 和 Token ↗" if self._is_zh() else "Get UID & Token ↗")
+
+        elif provider == "imgur":
+            self.lbl_context.config(text=self.trans("lbl_imgur_client_id"))
+            self.lbl_context.pack(anchor=tk.W, pady=(0, 2))
+            self.context_entry.pack(fill=tk.X, ipady=3)
+            self.context_entry.config(show="*")
+            self.context_entry_var.set(self.config.get("imgur_client_id", ""))
+            self._show_token_link("https://api.imgur.com/oauth2/addclient", "获取 Client ID ↗" if self._is_zh() else "Get Client ID ↗")
+
         else:
-            # Catbox or 0x0.st don't require credentials
+            # Catbox or x0.at don't require credentials
             self.lbl_context.config(text=self.trans("lbl_no_config"))
             self.lbl_context.pack(anchor=tk.W, pady=(5, 5))
 
+    def _is_zh(self):
+        return "中文" in self.lang_var.get()
+
+    def _show_token_link(self, url, text):
+        """Display a clickable hyperlink label to open the token registration page."""
+        self._token_link_url = url
+        self.lbl_token_link.config(text=text)
+        self.lbl_token_link.pack(anchor=tk.W, pady=(4, 0))
+        self.lbl_token_link.bind("<Button-1>", lambda e: self._open_token_url())
+
+    def _open_token_url(self):
+        """Open the stored token URL in the system default browser."""
+        if self._token_link_url:
+            import webbrowser
+            try:
+                webbrowser.open(self._token_link_url)
+                self.log(self.trans("log_browser_open", self._token_link_url))
+            except Exception as e:
+                self.log(self.trans("log_browser_error", str(e)))
+
     def on_provider_change(self, event):
         self.update_context_fields()
+        self.save_settings(silent=True)
 
     def on_telegraph_shortcut_selected(self, event):
         val = self.tg_shortcut_combo.get()
         if val in DEFAULT_TELEGRAPH_DOMAINS:
             self.context_entry_var.set(val)
+        self.save_settings(silent=True)
 
     # ---------------- RIGHT PANEL: HISTORY CARD ----------------
     def build_ui_right(self, parent):
@@ -1275,7 +1363,7 @@ class UploaderApp:
         
         self.prov_var = tk.StringVar(value=self.config.get("default_provider", "x0.at"))
         self.prov_combo = ttk.Combobox(config_inner, textvariable=self.prov_var, 
-                                       values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse"],
+                                       values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur"],
                                        state="readonly", font=("Segoe UI", 9))
         self.prov_combo.pack(fill=tk.X, pady=(0, 10))
         self.prov_combo.bind("<<ComboboxSelected>>", self.on_provider_change)
@@ -1298,6 +1386,12 @@ class UploaderApp:
         self.tg_shortcut_combo = ttk.Combobox(self.context_frame, values=DEFAULT_TELEGRAPH_DOMAINS,
                                              state="readonly", font=("Segoe UI", 9))
         self.tg_shortcut_combo.bind("<<ComboboxSelected>>", self.on_telegraph_shortcut_selected)
+
+        # Clickable link to obtain token/API key
+        self.lbl_token_link = tk.Label(self.context_frame, text="", font=("Segoe UI", 8, "underline"),
+                                      bg=self.colors["card"], fg=self.colors["accent"],
+                                      cursor="hand2")
+        self._token_link_url = ""
         
         self.btn_migration = tk.Button(config_inner, text="🔄 图床迁移与链接替换", 
                                        bg=self.colors["border"], fg=self.colors["text"],
@@ -1311,21 +1405,25 @@ class UploaderApp:
 
         btn_action_frame = tk.Frame(config_inner, bg=self.colors["card"])
         btn_action_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
-        
-        self.btn_save = tk.Button(btn_action_frame, text="💾 保存配置", 
+
+        self.btn_test = tk.Button(btn_action_frame, text="⚡ 测试连接",
                                   bg=self.colors["border"], fg=self.colors["text"],
-                                  bd=0, relief="flat", padx=10, pady=6, 
-                                  font=("Segoe UI", 9, "bold"), cursor="hand2",
-                                  command=self.save_settings)
-        self.btn_save.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        
-        self.btn_test = tk.Button(btn_action_frame, text="⚡ 测试连接", 
-                                  bg=self.colors["border"], fg=self.colors["text"],
-                                  bd=0, relief="flat", padx=10, pady=6, 
+                                  bd=0, relief="flat", padx=10, pady=6,
                                   font=("Segoe UI", 9), cursor="hand2",
                                   command=self.test_connection)
-        self.btn_test.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
-        
+        self.btn_test.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
+        self.btn_test_all = tk.Button(btn_action_frame, text="🔍 测试所有",
+                                     bg=self.colors["border"], fg=self.colors["text"],
+                                     bd=0, relief="flat", padx=10, pady=6,
+                                     font=("Segoe UI", 9), cursor="hand2",
+                                     command=self.test_all_providers)
+        self.btn_test_all.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+
+        # Bind context_entry auto-save on FocusOut and Return
+        self.context_entry.bind("<FocusOut>", lambda e: self.save_settings(silent=True))
+        self.context_entry.bind("<Return>", lambda e: self.save_settings(silent=True))
+
         self.update_context_fields()
 
         # ---------------- RIGHT PANEL: HISTORY CARD ----------------
@@ -1495,27 +1593,38 @@ class UploaderApp:
                 
         threading.Thread(target=worker, daemon=True).start()
 
-    def save_settings(self):
-        """Persist current settings form variables to configuration file."""
+    def save_settings(self, silent=False):
+        """Persist current settings. If silent=True, skip toast and log message."""
         provider = self.prov_var.get()
         entry_val = self.context_entry_var.get().strip()
-        
+
         self.config["default_provider"] = provider
         if provider == "telegraph":
-            if not entry_val.startswith("http://") and not entry_val.startswith("https://"):
+            if not silent and not entry_val.startswith("http://") and not entry_val.startswith("https://"):
                 messagebox.showerror(self.trans("dialog_param_error_title"), self.trans("dialog_tg_error_msg"))
                 return
-            self.config["telegraph_domain"] = entry_val
+            if entry_val.startswith("http://") or entry_val.startswith("https://"):
+                self.config["telegraph_domain"] = entry_val
         elif provider == "imgbb":
             self.config["imgbb_api_key"] = entry_val
         elif provider == "sm.ms":
             self.config["smms_token"] = entry_val
         elif provider == "imgse":
             self.config["imgse_api_key"] = entry_val
-            
+        elif provider == "imgurl":
+            parts = entry_val.split(":", 1)
+            if len(parts) == 2:
+                self.config["imgurl_uid"] = parts[0].strip()
+                self.config["imgurl_token"] = parts[1].strip()
+            else:
+                self.config["imgurl_token"] = entry_val
+        elif provider == "imgur":
+            self.config["imgur_client_id"] = entry_val
+
         save_config(self.config)
-        self.log(self.trans("log_save_success"))
-        self.show_toast(self.trans("toast_save_success"))
+        if not silent:
+            self.log(self.trans("log_save_success"))
+            self.show_toast(self.trans("toast_save_success"))
 
     def test_connection(self):
         """Ping the selected provider's domain in a thread to check internet latency."""
@@ -1538,7 +1647,11 @@ class UploaderApp:
                     target_url = "https://smms.app"
                 elif provider == "imgse":
                     target_url = "https://imgse.com"
-                    
+                elif provider == "imgurl":
+                    target_url = "https://www.imgurl.org"
+                elif provider == "imgur":
+                    target_url = "https://api.imgur.com"
+
                 if not target_url:
                     self.log(self.trans("log_test_failed_no_url"))
                     return
@@ -1550,8 +1663,70 @@ class UploaderApp:
                 self.log(self.trans("log_test_success", elapsed, r.status_code))
             except Exception as e:
                 self.log(self.trans("log_test_failed", str(e)))
-                
+
         threading.Thread(target=worker, daemon=True).start()
+
+    def test_all_providers(self):
+        """Concurrently ping all providers; log each result immediately, then show sorted summary."""
+        import requests
+
+        PROVIDER_URLS = {
+            "x0.at":     "https://x0.at/",
+            "catbox":    "https://catbox.moe",
+            "telegraph": self.config.get("telegraph_domain", "https://telegra.ph"),
+            "imgbb":     "https://api.imgbb.com",
+            "sm.ms":     "https://smms.app",
+            "imgse":     "https://imgse.com",
+            "imgurl":    "https://www.imgurl.org",
+            "imgur":     "https://api.imgur.com",
+        }
+
+        is_zh = "中文" in self.lang_var.get()
+        total = len(PROVIDER_URLS)
+        sep = "-" * 38
+
+        self.log("🔍 " + ("开始并行测试，结果实时显示..." if is_zh else "Testing all providers in parallel, results appear as they arrive..."))
+        self.log(sep)
+        self.btn_test_all.config(state="disabled")
+
+        results = []
+        lock = threading.Lock()
+        threads_done = [0]
+
+        def ping(name, url):
+            try:
+                start = time.time()
+                requests.head(url, timeout=10)
+                ms = int((time.time() - start) * 1000)
+                status = f"{ms} ms"
+                err = False
+            except Exception:
+                ms = 99999
+                status = "超时/失败" if "中文" in self.lang_var.get() else "Timeout/Failed"
+                err = True
+
+            icon = "✅" if not err else "❌"
+            self.root.after(0, lambda n=name, s=status, i=icon: self.log(f"{i}  {n:<12} {s}"))
+
+            with lock:
+                results.append((ms, name, status, err))
+                threads_done[0] += 1
+                if threads_done[0] == total:
+                    def render_summary():
+                        results.sort(key=lambda x: x[0])
+                        zh = "中文" in self.lang_var.get()
+                        self.log(sep)
+                        self.log("🏆 排序结果 (延迟从小到大):" if zh else "🏆 Ranking (fastest to slowest):")
+                        for rank, (ms_val, pname, pstatus, is_err) in enumerate(results, 1):
+                            medals = ["🥇", "🥈", "🥉"]
+                            medal = medals[rank - 1] if rank <= 3 else f"  #{rank}"
+                            self.log(f"{medal}  {pname:<12} {pstatus}")
+                        self.log(sep)
+                        self.btn_test_all.config(state="normal")
+                    self.root.after(0, render_summary)
+
+        for pname, purl in PROVIDER_URLS.items():
+            threading.Thread(target=ping, args=(pname, purl), daemon=True).start()
 
     # ---------------- COPY & UTILITY FUNCTIONS ----------------
     def show_toast(self, text):
@@ -1878,12 +2053,12 @@ class UploaderApp:
         
         tk.Label(sel_frame, text=self.trans("step1_src"), bg=self.colors["card"], fg=self.colors["text_muted"]).grid(row=0, column=0, sticky=tk.W)
         src_prov_var = tk.StringVar(value="x0.at")
-        src_prov_combo = ttk.Combobox(sel_frame, textvariable=src_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse"], state="readonly", width=12)
+        src_prov_combo = ttk.Combobox(sel_frame, textvariable=src_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur"], state="readonly", width=12)
         src_prov_combo.grid(row=0, column=1, padx=(5, 15))
-        
+
         tk.Label(sel_frame, text=self.trans("step1_dst"), bg=self.colors["card"], fg=self.colors["text_muted"]).grid(row=0, column=2, sticky=tk.W)
         dst_prov_var = tk.StringVar(value="catbox")
-        dst_prov_combo = ttk.Combobox(sel_frame, textvariable=dst_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse"], state="readonly", width=12)
+        dst_prov_combo = ttk.Combobox(sel_frame, textvariable=dst_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur"], state="readonly", width=12)
         dst_prov_combo.grid(row=0, column=3, padx=5)
         
         btn_start_migrate = tk.Button(sel_frame, text=self.trans("step1_btn"), 
