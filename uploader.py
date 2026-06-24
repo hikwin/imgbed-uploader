@@ -62,7 +62,10 @@ def load_config():
     config = {
         "default_provider": "x0.at",
         "telegraph_domain": "https://telegram-image.pages.dev",
-        "imgbb_api_key": ""
+        "imgbb_api_key": "",
+        "superbed_token": "",
+        "lskypro_url": "",
+        "lskypro_token": ""
     }
     if os.path.exists(CONFIG_PATH):
         try:
@@ -475,6 +478,58 @@ def perform_upload(file_path, provider, config):
         error_msg = res_json.get("data", {}).get("error", "未知错误")
         raise Exception(f"Imgur 上传失败: {error_msg}")
 
+    elif provider == "superbed":
+        token = config.get("superbed_token", "").strip()
+        if not token:
+            raise Exception("聚合图床未配置 Token，请先在设置中填写")
+
+        url = "https://api.superbed.cn/upload"
+        with open(file_path, "rb") as f:
+            files = {"file": (file_name, f, mime_type)}
+            data = {"token": token}
+            response = requests.post(url, files=files, data=data, timeout=45)
+
+        response.raise_for_status()
+        res_json = response.json()
+        if res_json.get("err") == 0 and "url" in res_json:
+            return res_json["url"]
+        error_msg = res_json.get("msg", "未知错误")
+        raise Exception(f"聚合图床上传失败: {error_msg}")
+
+    elif provider == "lskypro":
+        api_url = config.get("lskypro_url", "").strip()
+        token = config.get("lskypro_token", "").strip()
+        if not api_url or not token:
+            raise Exception("兰空图床未配置 API URL 或 Token，请先在设置中填写")
+
+        if not api_url.endswith("/api/v1/upload"):
+            api_url = api_url.rstrip("/")
+            if api_url.endswith("/api/v1"):
+                api_url = api_url + "/upload"
+            else:
+                api_url = api_url + "/api/v1/upload"
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json"
+        }
+        with open(file_path, "rb") as f:
+            files = {"file": (file_name, f, mime_type)}
+            response = requests.post(api_url, headers=headers, files=files, timeout=45)
+
+        response.raise_for_status()
+        res_json = response.json()
+        if res_json.get("status") and "data" in res_json:
+            data_part = res_json["data"]
+            if isinstance(data_part, dict):
+                links = data_part.get("links")
+                if isinstance(links, dict) and "url" in links:
+                    return links["url"]
+                if "url" in data_part:
+                    return data_part["url"]
+        error_msg = res_json.get("message", "未知错误")
+        raise Exception(f"兰空图床上传失败: {error_msg}")
+
     else:
         raise ValueError(f"未知的图床提供商: {provider}")
 
@@ -565,6 +620,8 @@ LANG_DICTS = {
         "lbl_imgse_key": "Imgse API Key (密钥):",
         "lbl_imgurl_key": "ImgURL 认证 (UID:Token 格式):",
         "lbl_imgur_client_id": "Imgur Client ID:",
+        "lbl_superbed_key": "聚合图床 Token (密钥):",
+        "lbl_lskypro_key": "兰空图床 (API_URL:Token 格式):",
         "lbl_no_config": "提示: 该图床不需要任何额外配置",
         
         # Log and Dialog Messages
@@ -692,6 +749,8 @@ LANG_DICTS = {
         "lbl_imgse_key": "Imgse API Key (Secret Key):",
         "lbl_imgurl_key": "ImgURL Auth (UID:Token format):",
         "lbl_imgur_client_id": "Imgur Client ID:",
+        "lbl_superbed_key": "Superbed Token:",
+        "lbl_lskypro_key": "Lsky Pro Auth (API_URL:Token format):",
         "lbl_no_config": "Hint: No extra configuration needed for this provider",
         
         # Log and Dialog Messages
@@ -1071,7 +1130,7 @@ class UploaderApp:
             self.context_entry.pack(fill=tk.X, ipady=3)
             self.context_entry.config(show="")
             self.context_entry_var.set(stored if stored != ":" else "")
-            self._show_token_link("https://www.imgurl.org/user/settings", "获取 UID 和 Token ↗" if self._is_zh() else "Get UID & Token ↗")
+            self._show_token_link("https://www.imgurl.org/", "获取 UID 和 Token ↗" if self._is_zh() else "Get UID & Token ↗")
 
         elif provider == "imgur":
             self.lbl_context.config(text=self.trans("lbl_imgur_client_id"))
@@ -1080,6 +1139,23 @@ class UploaderApp:
             self.context_entry.config(show="*")
             self.context_entry_var.set(self.config.get("imgur_client_id", ""))
             self._show_token_link("https://api.imgur.com/oauth2/addclient", "获取 Client ID ↗" if self._is_zh() else "Get Client ID ↗")
+
+        elif provider == "superbed":
+            self.lbl_context.config(text=self.trans("lbl_superbed_key"))
+            self.lbl_context.pack(anchor=tk.W, pady=(0, 2))
+            self.context_entry.pack(fill=tk.X, ipady=3)
+            self.context_entry.config(show="*")
+            self.context_entry_var.set(self.config.get("superbed_token", ""))
+            self._show_token_link("https://www.superbed.cn", "获取 Token ↗" if self._is_zh() else "Get Token ↗")
+
+        elif provider == "lskypro":
+            stored = self.config.get("lskypro_url", "") + ":" + self.config.get("lskypro_token", "")
+            self.lbl_context.config(text=self.trans("lbl_lskypro_key"))
+            self.lbl_context.pack(anchor=tk.W, pady=(0, 2))
+            self.context_entry.pack(fill=tk.X, ipady=3)
+            self.context_entry.config(show="")
+            self.context_entry_var.set(stored if stored != ":" else "")
+            self._show_token_link("https://www.lsky.pro/", "兰空图床官网 ↗" if self._is_zh() else "Lsky Pro Official ↗")
 
         else:
             # Catbox or x0.at don't require credentials
@@ -1363,7 +1439,7 @@ class UploaderApp:
         
         self.prov_var = tk.StringVar(value=self.config.get("default_provider", "x0.at"))
         self.prov_combo = ttk.Combobox(config_inner, textvariable=self.prov_var, 
-                                       values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur"],
+                                       values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur", "superbed", "lskypro"],
                                        state="readonly", font=("Segoe UI", 9))
         self.prov_combo.pack(fill=tk.X, pady=(0, 10))
         self.prov_combo.bind("<<ComboboxSelected>>", self.on_provider_change)
@@ -1620,6 +1696,15 @@ class UploaderApp:
                 self.config["imgurl_token"] = entry_val
         elif provider == "imgur":
             self.config["imgur_client_id"] = entry_val
+        elif provider == "superbed":
+            self.config["superbed_token"] = entry_val
+        elif provider == "lskypro":
+            parts = entry_val.rsplit(":", 1)
+            if len(parts) == 2:
+                self.config["lskypro_url"] = parts[0].strip()
+                self.config["lskypro_token"] = parts[1].strip()
+            else:
+                self.config["lskypro_token"] = entry_val
 
         save_config(self.config)
         if not silent:
@@ -1651,6 +1736,10 @@ class UploaderApp:
                     target_url = "https://www.imgurl.org"
                 elif provider == "imgur":
                     target_url = "https://api.imgur.com"
+                elif provider == "superbed":
+                    target_url = "https://api.superbed.cn"
+                elif provider == "lskypro":
+                    target_url = self.config.get("lskypro_url", "").strip() or "https://helloimg.com"
 
                 if not target_url:
                     self.log(self.trans("log_test_failed_no_url"))
@@ -1679,6 +1768,8 @@ class UploaderApp:
             "imgse":     "https://imgse.com",
             "imgurl":    "https://www.imgurl.org",
             "imgur":     "https://api.imgur.com",
+            "superbed":  "https://api.superbed.cn",
+            "lskypro":   self.config.get("lskypro_url", "").strip() or "https://helloimg.com",
         }
 
         is_zh = "中文" in self.lang_var.get()
@@ -2053,12 +2144,12 @@ class UploaderApp:
         
         tk.Label(sel_frame, text=self.trans("step1_src"), bg=self.colors["card"], fg=self.colors["text_muted"]).grid(row=0, column=0, sticky=tk.W)
         src_prov_var = tk.StringVar(value="x0.at")
-        src_prov_combo = ttk.Combobox(sel_frame, textvariable=src_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur"], state="readonly", width=12)
+        src_prov_combo = ttk.Combobox(sel_frame, textvariable=src_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur", "superbed", "lskypro"], state="readonly", width=12)
         src_prov_combo.grid(row=0, column=1, padx=(5, 15))
 
         tk.Label(sel_frame, text=self.trans("step1_dst"), bg=self.colors["card"], fg=self.colors["text_muted"]).grid(row=0, column=2, sticky=tk.W)
         dst_prov_var = tk.StringVar(value="catbox")
-        dst_prov_combo = ttk.Combobox(sel_frame, textvariable=dst_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur"], state="readonly", width=12)
+        dst_prov_combo = ttk.Combobox(sel_frame, textvariable=dst_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur", "superbed", "lskypro"], state="readonly", width=12)
         dst_prov_combo.grid(row=0, column=3, padx=5)
         
         btn_start_migrate = tk.Button(sel_frame, text=self.trans("step1_btn"), 
