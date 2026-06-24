@@ -10,9 +10,25 @@ import traceback
 import sqlite3
 import hashlib
 import shutil
+import socket
+import urllib3.util.connection
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
+
+# Thread-local tracker for capturing sockets in the main upload thread
+_upload_tracker = threading.local()
+_orig_create_connection = urllib3.util.connection.create_connection
+
+def _my_create_connection(*args, **kwargs):
+    sock = _orig_create_connection(*args, **kwargs)
+    if getattr(_upload_tracker, 'is_upload_thread', False):
+        if hasattr(_upload_tracker, 'active_sockets'):
+            _upload_tracker.active_sockets.append(sock)
+    return sock
+
+urllib3.util.connection.create_connection = _my_create_connection
+
 
 try:
     import windnd
@@ -50,18 +66,10 @@ LOG_PATH = os.path.join(EXE_DIR, "uploader.log")
 DB_PATH = os.path.join(EXE_DIR, "uploader.db")
 BACKUP_DIR = os.path.join(EXE_DIR, "images_backup")
 
-DEFAULT_TELEGRAPH_DOMAINS = [
-    "https://telegram-image.pages.dev",
-    "https://telegra.ph",
-    "https://telegraph.dog",
-    "https://pic.tele.pg"
-]
-
 def load_config():
     """Load configuration from local JSON file."""
     config = {
         "default_provider": "x0.at",
-        "telegraph_domain": "https://telegram-image.pages.dev",
         "imgbb_api_key": "",
         "superbed_token": "",
         "lskypro_url": "",
@@ -334,24 +342,7 @@ def perform_upload(file_path, provider, config):
     mime_type, _ = mimetypes.guess_type(file_path)
     mime_type = mime_type or "image/png"
 
-    if provider == "telegraph":
-        if file_size > 5 * 1024 * 1024:
-            raise Exception("Telegraph 图床单张图片大小限制为 5MB")
-        
-        domain = config.get("telegraph_domain", "https://telegra.ph").rstrip('/')
-        url = "https://telegra.ph/upload"
-        
-        with open(file_path, "rb") as f:
-            files = {"file": (file_name, f, mime_type)}
-            response = requests.post(url, files=files, timeout=30)
-            
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, list) and len(data) > 0 and "src" in data[0]:
-            return f"{domain}{data[0]['src']}"
-        raise Exception(f"Telegraph 返回格式错误: {data}")
-
-    elif provider == "catbox":
+    if provider == "catbox":
         if file_size > 200 * 1024 * 1024:
             raise Exception("Catbox 图床单文件大小限制为 200MB")
             
@@ -596,6 +587,9 @@ LANG_DICTS = {
         "title": "i图床 - 匿名图床上传工具",
         "subtitle": "Typora 适配版 • 免注册免登录",
         "paste_btn": "📋 粘贴并上传 (剪贴板图片)",
+        "cancel_btn": "⏹️ 中断上传",
+        "log_upload_cancelling": "正在中断上传...",
+        "log_upload_cancelled": "上传已中断。",
         "drag_text": "点击选择或拖拽图片到此处上传",
         "drag_sub": "支持 PNG, JPG, JPEG, GIF, WEBP",
         "settings_title": "⚙️ 图床参数设置",
@@ -613,8 +607,6 @@ LANG_DICTS = {
         "col_provider": "图床",
         "col_filename": "文件名",
         "col_size": "大小",
-        "lbl_tg_proxy": "Telegraph 反代域名 (含协议):",
-        "tg_custom_proxy": "自定义反代 / 推荐节点 ↓",
         "lbl_imgbb_key": "ImgBB API Key (密钥):",
         "lbl_smms_token": "SM.MS Secret Token (密钥):",
         "lbl_imgse_key": "Imgse API Key (密钥):",
@@ -651,7 +643,6 @@ LANG_DICTS = {
         "dialog_upload_failed_title": "上传失败",
         "dialog_upload_failed_msg": "上传过程中出现错误:\n{}",
         "dialog_param_error_title": "参数错误",
-        "dialog_tg_error_msg": "Telegraph 反代域名必须以 http:// 或 https:// 开头",
         "log_save_success": "配置保存成功。",
         "toast_save_success": "配置已保存",
         "log_start_test": "开始测试连接 {} ...",
@@ -725,6 +716,9 @@ LANG_DICTS = {
         "title": "Anonymous Image Uploader",
         "subtitle": "Typora Adapter • No registration required",
         "paste_btn": "📋 Paste & Upload (Clipboard)",
+        "cancel_btn": "⏹️ Abort Upload",
+        "log_upload_cancelling": "Cancelling upload...",
+        "log_upload_cancelled": "Upload cancelled.",
         "drag_text": "Click to select or drag images here to upload",
         "drag_sub": "Supports PNG, JPG, JPEG, GIF, WEBP",
         "settings_title": "⚙️ Image Provider Settings",
@@ -742,8 +736,6 @@ LANG_DICTS = {
         "col_provider": "Provider",
         "col_filename": "Filename",
         "col_size": "Size",
-        "lbl_tg_proxy": "Telegraph Proxy Domain (with protocol):",
-        "tg_custom_proxy": "Custom Proxy / Recommended Nodes ↓",
         "lbl_imgbb_key": "ImgBB API Key (Secret Key):",
         "lbl_smms_token": "SM.MS Secret Token (Secret Key):",
         "lbl_imgse_key": "Imgse API Key (Secret Key):",
@@ -780,7 +772,6 @@ LANG_DICTS = {
         "dialog_upload_failed_title": "Upload Failed",
         "dialog_upload_failed_msg": "An error occurred during upload:\n{}",
         "dialog_param_error_title": "Parameter Error",
-        "dialog_tg_error_msg": "Telegraph proxy domain must start with http:// or https://",
         "log_save_success": "Configuration saved successfully.",
         "toast_save_success": "Configuration saved",
         "log_start_test": "Starting connection test for {} ...",
@@ -920,6 +911,7 @@ class UploaderApp:
             "success": "#a6e3a1",      # Green
             "warning": "#f9e2af",      # Yellow
             "danger": "#f38ba8",       # Red
+            "danger_hover": "#f5a0b8", # Lighter red
             "input_bg": "#181825"
         }
         
@@ -968,7 +960,10 @@ class UploaderApp:
         self.root.title(d["title"])
         self.title_lbl.config(text=d["title"])
         self.subtitle_lbl.config(text=d["subtitle"])
-        self.btn_paste.config(text=d["paste_btn"])
+        if getattr(self, "is_uploading", False):
+            self.btn_paste.config(text=d["cancel_btn"])
+        else:
+            self.btn_paste.config(text=d["paste_btn"])
         self.lbl_drag_text.config(text=d["drag_text"])
         self.lbl_drag_sub.config(text=d["drag_sub"])
         self.lbl_cfg_title.config(text=d["settings_title"])
@@ -1073,30 +1068,11 @@ class UploaderApp:
         # Clean current layout in context frame
         self.lbl_context.pack_forget()
         self.context_entry.pack_forget()
-        self.tg_shortcut_combo.pack_forget()
         self.lbl_token_link.pack_forget()
         self.context_entry.config(show="")
         self._token_link_url = ""
         
-        if provider == "telegraph":
-            self.lbl_context.config(text=self.trans("lbl_tg_proxy"))
-            self.lbl_context.pack(anchor=tk.W, pady=(0, 2))
-            
-            # Pack entry and domain selector
-            self.tg_shortcut_combo.pack(fill=tk.X, pady=(0, 4))
-            self.context_entry.pack(fill=tk.X, ipady=3)
-            
-            # Load stored domain
-            saved_domain = self.config.get("telegraph_domain", "https://telegram-image.pages.dev")
-            self.context_entry_var.set(saved_domain)
-            
-            # Set default shortcut if matched
-            if saved_domain in DEFAULT_TELEGRAPH_DOMAINS:
-                self.tg_shortcut_combo.set(saved_domain)
-            else:
-                self.tg_shortcut_combo.set(self.trans("tg_custom_proxy"))
-
-        elif provider == "imgbb":
+        if provider == "imgbb":
             self.lbl_context.config(text=self.trans("lbl_imgbb_key"))
             self.lbl_context.pack(anchor=tk.W, pady=(0, 2))
             self.context_entry.pack(fill=tk.X, ipady=3)
@@ -1186,11 +1162,7 @@ class UploaderApp:
         self.update_context_fields()
         self.save_settings(silent=True)
 
-    def on_telegraph_shortcut_selected(self, event):
-        val = self.tg_shortcut_combo.get()
-        if val in DEFAULT_TELEGRAPH_DOMAINS:
-            self.context_entry_var.set(val)
-        self.save_settings(silent=True)
+
 
     # ---------------- RIGHT PANEL: HISTORY CARD ----------------
     def build_ui_right(self, parent):
@@ -1369,8 +1341,10 @@ class UploaderApp:
                                    font=("Segoe UI", 10, "bold"), cursor="hand2",
                                    command=self.paste_and_upload)
         self.btn_paste.pack(fill=tk.X)
-        self.btn_paste.bind("<Enter>", lambda e: e.widget.config(bg=self.colors["accent_hover"]))
-        self.btn_paste.bind("<Leave>", lambda e: e.widget.config(bg=self.colors["accent"]))
+        self.btn_paste.bind("<Enter>", lambda e: e.widget.config(
+            bg=self.colors["danger_hover"] if getattr(self, "is_uploading", False) else self.colors["accent_hover"]))
+        self.btn_paste.bind("<Leave>", lambda e: e.widget.config(
+            bg=self.colors["danger"] if getattr(self, "is_uploading", False) else self.colors["accent"]))
         
         # 拖拽上传区域 (Drag & Drop Zone)
         self.drag_zone = tk.Frame(upload_inner, bg=self.colors["input_bg"], bd=0,
@@ -1439,7 +1413,7 @@ class UploaderApp:
         
         self.prov_var = tk.StringVar(value=self.config.get("default_provider", "x0.at"))
         self.prov_combo = ttk.Combobox(config_inner, textvariable=self.prov_var, 
-                                       values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur", "superbed", "lskypro"],
+                                       values=["x0.at", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur", "superbed", "lskypro"],
                                        state="readonly", font=("Segoe UI", 9))
         self.prov_combo.pack(fill=tk.X, pady=(0, 10))
         self.prov_combo.bind("<<ComboboxSelected>>", self.on_provider_change)
@@ -1458,10 +1432,6 @@ class UploaderApp:
                                       highlightthickness=1, highlightbackground=self.colors["border"], 
                                       highlightcolor=self.colors["accent"], font=("Segoe UI", 9))
         self.context_entry.pack(fill=tk.X, ipady=3)
-        
-        self.tg_shortcut_combo = ttk.Combobox(self.context_frame, values=DEFAULT_TELEGRAPH_DOMAINS,
-                                             state="readonly", font=("Segoe UI", 9))
-        self.tg_shortcut_combo.bind("<<ComboboxSelected>>", self.on_telegraph_shortcut_selected)
 
         # Clickable link to obtain token/API key
         self.lbl_token_link = tk.Label(self.context_frame, text="", font=("Segoe UI", 8, "underline"),
@@ -1675,13 +1645,7 @@ class UploaderApp:
         entry_val = self.context_entry_var.get().strip()
 
         self.config["default_provider"] = provider
-        if provider == "telegraph":
-            if not silent and not entry_val.startswith("http://") and not entry_val.startswith("https://"):
-                messagebox.showerror(self.trans("dialog_param_error_title"), self.trans("dialog_tg_error_msg"))
-                return
-            if entry_val.startswith("http://") or entry_val.startswith("https://"):
-                self.config["telegraph_domain"] = entry_val
-        elif provider == "imgbb":
+        if provider == "imgbb":
             self.config["imgbb_api_key"] = entry_val
         elif provider == "sm.ms":
             self.config["smms_token"] = entry_val
@@ -1711,18 +1675,36 @@ class UploaderApp:
             self.log(self.trans("log_save_success"))
             self.show_toast(self.trans("toast_save_success"))
 
+    def get_tcp_latency(self, url, timeout=5):
+        from urllib.parse import urlparse
+        import socket
+        parsed = urlparse(url)
+        host = parsed.netloc or parsed.path
+        if ":" in host:
+            host, port = host.split(":", 1)
+            port = int(port)
+        else:
+            port = 80 if url.startswith("http://") else 443
+            
+        if not parsed.netloc and "/" in host:
+            host = host.split("/", 1)[0]
+            
+        start_time = time.time()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return int((time.time() - start_time) * 1000)
+
     def test_connection(self):
         """Ping the selected provider's domain in a thread to check internet latency."""
-        import requests
         provider = self.prov_var.get()
         self.log(self.trans("log_start_test", provider))
         
         def worker():
             try:
                 target_url = ""
-                if provider == "telegraph":
-                    target_url = self.context_entry_var.get().strip()
-                elif provider == "catbox":
+                if provider == "catbox":
                     target_url = "https://catbox.moe"
                 elif provider == "x0.at":
                     target_url = "https://x0.at/"
@@ -1745,11 +1727,8 @@ class UploaderApp:
                     self.log(self.trans("log_test_failed_no_url"))
                     return
                     
-                start_time = time.time()
-                # Disable SSL verification issues warnings in logging if needed, standard requests head
-                r = requests.head(target_url, timeout=10)
-                elapsed = int((time.time() - start_time) * 1000)
-                self.log(self.trans("log_test_success", elapsed, r.status_code))
+                elapsed = self.get_tcp_latency(target_url, timeout=5)
+                self.log(self.trans("log_test_success", elapsed, "TCP"))
             except Exception as e:
                 self.log(self.trans("log_test_failed", str(e)))
 
@@ -1762,7 +1741,6 @@ class UploaderApp:
         PROVIDER_URLS = {
             "x0.at":     "https://x0.at/",
             "catbox":    "https://catbox.moe",
-            "telegraph": self.config.get("telegraph_domain", "https://telegra.ph"),
             "imgbb":     "https://api.imgbb.com",
             "sm.ms":     "https://smms.app",
             "imgse":     "https://imgse.com",
@@ -1774,21 +1752,18 @@ class UploaderApp:
 
         is_zh = "中文" in self.lang_var.get()
         total = len(PROVIDER_URLS)
-        sep = "-" * 38
+        sep = "-" * 54
 
         self.log("🔍 " + ("开始并行测试，结果实时显示..." if is_zh else "Testing all providers in parallel, results appear as they arrive..."))
         self.log(sep)
         self.btn_test_all.config(state="disabled")
 
-        results = []
         lock = threading.Lock()
         threads_done = [0]
 
         def ping(name, url):
             try:
-                start = time.time()
-                requests.head(url, timeout=10)
-                ms = int((time.time() - start) * 1000)
+                ms = self.get_tcp_latency(url, timeout=5)
                 status = f"{ms} ms"
                 err = False
             except Exception:
@@ -1797,24 +1772,12 @@ class UploaderApp:
                 err = True
 
             icon = "✅" if not err else "❌"
-            self.root.after(0, lambda n=name, s=status, i=icon: self.log(f"{i}  {n:<12} {s}"))
+            self.root.after(0, lambda n=name, s=status, i=icon: self.log(f"{i}  {n:<36} {s}"))
 
             with lock:
-                results.append((ms, name, status, err))
                 threads_done[0] += 1
                 if threads_done[0] == total:
-                    def render_summary():
-                        results.sort(key=lambda x: x[0])
-                        zh = "中文" in self.lang_var.get()
-                        self.log(sep)
-                        self.log("🏆 排序结果 (延迟从小到大):" if zh else "🏆 Ranking (fastest to slowest):")
-                        for rank, (ms_val, pname, pstatus, is_err) in enumerate(results, 1):
-                            medals = ["🥇", "🥈", "🥉"]
-                            medal = medals[rank - 1] if rank <= 3 else f"  #{rank}"
-                            self.log(f"{medal}  {pname:<12} {pstatus}")
-                        self.log(sep)
-                        self.btn_test_all.config(state="normal")
-                    self.root.after(0, render_summary)
+                    self.root.after(0, lambda: self.btn_test_all.config(state="normal"))
 
         for pname, purl in PROVIDER_URLS.items():
             threading.Thread(target=ping, args=(pname, purl), daemon=True).start()
@@ -1981,7 +1944,7 @@ class UploaderApp:
     def paste_and_upload(self):
         """Query system clipboard, extract file or raw screenshot, and upload."""
         if getattr(self, "is_uploading", False):
-            self.log(self.trans("log_uploading_wait"))
+            self.cancel_upload()
             return
         self.log(self.trans("log_checking_clipboard"))
         try:
@@ -2026,16 +1989,36 @@ class UploaderApp:
             self.log(self.trans("log_clipboard_error", str(e)))
             traceback.print_exc()
 
+    def cancel_upload(self):
+        """Cancel the current upload process."""
+        self.upload_cancelled = True
+        self.log(self.trans("log_upload_cancelling"))
+        if hasattr(self, "current_upload_sockets"):
+            for s in self.current_upload_sockets:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                    s.close()
+                except Exception:
+                    pass
+            self.current_upload_sockets.clear()
+        
+        self.btn_paste.config(text=self.trans("paste_btn"), bg=self.colors["accent"], fg="#11111b")
+        self.is_uploading = False
+
     def start_upload_thread(self, file_path, is_temp=False):
         """Asynchronously execute upload requests to keep UI responsive."""
         provider = self.prov_var.get()
         self.log(self.trans("log_waiting_upload", provider, os.path.basename(file_path)))
         
-        # Disable buttons temporarily during uploads to prevent multiple simultaneous click spam
         self.is_uploading = True
-        self.btn_paste.config(state="disabled")
+        self.upload_cancelled = False
+        self.current_upload_sockets = []
+        
+        self.btn_paste.config(text=self.trans("cancel_btn"), bg=self.colors["danger"], fg="#ffffff")
         
         def worker():
+            _upload_tracker.is_upload_thread = True
+            _upload_tracker.active_sockets = self.current_upload_sockets
             try:
                 # Retrieve fresh copy of config in thread
                 fresh_config = load_config()
@@ -2076,14 +2059,25 @@ class UploaderApp:
                     except Exception:
                         pass
             except Exception as e:
-                self.log(self.trans("log_upload_error", os.path.basename(file_path), str(e)))
-                self.root.after(0, self.on_upload_error, str(e))
+                if getattr(self, "upload_cancelled", False):
+                    self.log(self.trans("log_upload_cancelled"))
+                    if is_temp:
+                        try:
+                            os.remove(file_path)
+                        except Exception:
+                            pass
+                else:
+                    self.log(self.trans("log_upload_error", os.path.basename(file_path), str(e)))
+                    self.root.after(0, self.on_upload_error, str(e))
+            finally:
+                _upload_tracker.is_upload_thread = False
+                _upload_tracker.active_sockets = []
                 
         threading.Thread(target=worker, daemon=True).start()
 
     def on_upload_success(self, url, filename):
         self.is_uploading = False
-        self.btn_paste.config(state="normal")
+        self.btn_paste.config(text=self.trans("paste_btn"), bg=self.colors["accent"], fg="#11111b", state="normal")
         self.last_uploaded_url = url
         self.last_uploaded_filename = filename
         self.update_link_display()
@@ -2104,7 +2098,7 @@ class UploaderApp:
         
     def on_upload_error(self, err_details):
         self.is_uploading = False
-        self.btn_paste.config(state="normal")
+        self.btn_paste.config(text=self.trans("paste_btn"), bg=self.colors["accent"], fg="#11111b", state="normal")
         messagebox.showerror(self.trans("dialog_upload_failed_title"), self.trans("dialog_upload_failed_msg", err_details))
 
     def open_migration_dialog(self):
@@ -2144,12 +2138,12 @@ class UploaderApp:
         
         tk.Label(sel_frame, text=self.trans("step1_src"), bg=self.colors["card"], fg=self.colors["text_muted"]).grid(row=0, column=0, sticky=tk.W)
         src_prov_var = tk.StringVar(value="x0.at")
-        src_prov_combo = ttk.Combobox(sel_frame, textvariable=src_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur", "superbed", "lskypro"], state="readonly", width=12)
+        src_prov_combo = ttk.Combobox(sel_frame, textvariable=src_prov_var, values=["x0.at", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur", "superbed", "lskypro"], state="readonly", width=12)
         src_prov_combo.grid(row=0, column=1, padx=(5, 15))
 
         tk.Label(sel_frame, text=self.trans("step1_dst"), bg=self.colors["card"], fg=self.colors["text_muted"]).grid(row=0, column=2, sticky=tk.W)
         dst_prov_var = tk.StringVar(value="catbox")
-        dst_prov_combo = ttk.Combobox(sel_frame, textvariable=dst_prov_var, values=["x0.at", "telegraph", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur", "superbed", "lskypro"], state="readonly", width=12)
+        dst_prov_combo = ttk.Combobox(sel_frame, textvariable=dst_prov_var, values=["x0.at", "catbox", "imgbb", "sm.ms", "imgse", "imgurl", "imgur", "superbed", "lskypro"], state="readonly", width=12)
         dst_prov_combo.grid(row=0, column=3, padx=5)
         
         btn_start_migrate = tk.Button(sel_frame, text=self.trans("step1_btn"), 
